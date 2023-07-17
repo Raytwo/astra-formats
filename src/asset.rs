@@ -16,6 +16,7 @@ pub const MESH_FILTER_HASH: i128 = 161675840667827063370573699974811358877;
 pub const MESH_RENDERER_HASH: i128 = -72208694526585686254499184803611500559;
 pub const AVATAR_HASH: i128 = -125274292396291140701441925783063757818;
 pub const MATERIAL_HASH: i128 = 38580764854673472068260433708032579683;
+pub const SHADER_HASH: i128 = 104589021663950473561034844455919488675;
 pub const TRANSFORM_HASH: i128 = 113257848714874300609633886051190185078;
 pub const GAME_OBJECT_HASH: i128 = -105210905878938171704810466949008006266;
 pub const SKINNED_MESH_RENDERER_HASH: i128 = 7922304469189766333664176646841079590;
@@ -185,6 +186,7 @@ fn read_assets<R: Read + Seek>(
     for obj in sorted_objects {
         let ty = &types[obj.type_id as usize]; // TODO: Bounds check.
         reader.seek(SeekFrom::Start(data_offset + obj.offset))?;
+        dbg!("Type hash: {}", ty.type_hash);
         assets.push(Asset::read_options(
             reader,
             endian,
@@ -450,6 +452,7 @@ pub enum Asset {
     Avatar(Avatar),
     Transform(Transform),
     Material(Material),
+    Shader(Shader),
     SkinnedMeshRenderer(SkinnedMeshRenderer),
     SpringJob(MonoBehavior<SpringJob>),
     SpringBone(MonoBehavior<SpringBone>),
@@ -474,6 +477,7 @@ impl Asset {
             Asset::Avatar(_) => AVATAR_HASH,
             Asset::Transform(_) => TRANSFORM_HASH,
             Asset::Material(_) => MATERIAL_HASH,
+            Asset::Shader(_) => SHADER_HASH,
             Asset::SkinnedMeshRenderer(_) => SKINNED_MESH_RENDERER_HASH,
             Asset::SpringJob(_) => SPRING_JOB_MONO_BEHAVIOR_HASH,
             Asset::SpringBone(_) => SPRING_BONE_MONO_BEHAVIOR_HASH,
@@ -1539,6 +1543,128 @@ pub struct ColorRGBA {
     pub g: f32,
     pub b: f32,
     pub a: f32,
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct Shader {
+    pub name: UString,
+    pub parsed_form: SerializedShader,
+    #[brw(align_before = 4)]
+    pub platforms: UArray<u32>,
+    pub compressed_lengths: UArray<u32>,
+    pub decompressed_lengths: UArray<u32>,
+    pub compressed_blob: UArray<u8>,
+    #[brw(align_before = 4)]
+    pub dependencies: UArray<PPtr>,
+    pub non_modifiable_textres: UArray<(UString, PPtr)>,
+    pub shader_is_baked: u8
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct SerializedShader {
+    pub prop_info: UArray<SerializedProperty>,
+    pub sub_shaders: UArray<SerializedSubShader>,
+    pub name: UString,
+    pub custom_editor_name: UString,
+    pub fallback_name: UString,
+    pub dependencies: UArray<SerializedShaderDependency>,
+    pub disable_no_subshaders_message: u8,
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct SerializedShaderDependency {
+    pub from: UString,
+    pub to: UString,
+} 
+
+#[binrw]
+#[derive(Debug)]
+pub struct SerializedSubShader {
+    pub passes: UArray<SerializedPass>,
+    pub tags: UArray<(UString, UString)>,
+    pub lod: i32,
+} 
+
+#[binrw]
+#[derive(Debug)]
+pub struct SerializedPass {
+    pub editor_data_hash: UArray<i128>,
+    #[brw(align_before = 4)]
+    pub platforms: UArray<u8>,
+    #[brw(align_before = 4)]
+    pub name_indices: UArray<(UString, i32)>,
+    pub ty: PassType,
+    // State
+    pub program_mask: u32,
+    // Serialized programs
+    pub has_instancing_variant: u8,
+    pub has_procedural_instancing_variant: u8,
+    pub use_name: UString,
+    pub name: UString,
+    pub texture_name: UString,
+    pub tags: UArray<(UString, UString)>,
+
+}
+
+#[binrw]
+#[brw(repr = i32)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub enum PassType {
+    Normal = 0,
+    Use = 1,
+    Grab = 2
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct SerializedProperty {
+    pub name: UString,
+    pub description: UString,
+    pub attributes: UArray<UString>,
+    pub ty: SerializedPropertyType,
+    pub flags: u32,
+    #[br(count = 4)]
+    pub def_value: Vec<f32>,
+    pub def_texture: SerializedTextureProperty
+}
+
+#[binrw]
+#[brw(repr = i32)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub enum TextureDimension {
+    Unknown = -1,
+    None = 0,
+    Any,
+    Tex2D,
+    Tex3D,
+    Cube,
+    Tex2DArray,
+    CubeArray
+}
+
+#[binrw]
+#[derive(Debug)]
+pub struct SerializedTextureProperty {
+    pub default_name: UString,
+    pub tex_dim: TextureDimension,
+}
+
+#[binrw]
+#[brw(repr = i32)]
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+#[allow(non_camel_case_types)]
+pub enum SerializedPropertyType {
+    Color,
+    Vector,
+    Float,
+    Range,
+    Texture,
+    Int
 }
 
 #[binrw]
