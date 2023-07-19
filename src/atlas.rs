@@ -58,7 +58,6 @@ impl SpriteAtlasWrapper {
     }
 }
 
-#[derive(Debug)]
 pub struct AtlasBundle(Bundle);
 
 impl AtlasBundle {

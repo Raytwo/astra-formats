@@ -8,7 +8,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use lzma_rs::decompress::UnpackedSize;
 
-use crate::{Asset, AssetFile, MessageMap, MonoBehavior, TerrainData, TextAsset};
+use crate::{Asset, AssetFile, MessageMap, MonoBehavior, TerrainData, TextAsset, AssetFileLite};
 
 #[cfg(feature = "msbt_script")]
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
     parse_msbt_script,
 };
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct Bundle {
     pub(crate) files: IndexMap<String, BundleFile>,
 }
@@ -24,6 +24,10 @@ pub struct Bundle {
 impl Bundle {
     pub fn load<T: AsRef<Path>>(path: T) -> Result<Self> {
         Self::from_slice(&std::fs::read(path)?)
+    }
+
+    pub fn load_lite<T: AsRef<Path>>(path: T) -> Result<Self> {
+        Self::from_slice_lite(&std::fs::read(path)?)
     }
 
     pub fn list_files<T>(input: &mut T) -> Result<Vec<String>>
@@ -98,6 +102,68 @@ impl Bundle {
         Ok(Self { files })
     }
 
+    pub fn from_slice_lite(raw_bundle: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor::new(raw_bundle);
+        let meta_data = Self::read_header_and_meta_data(&mut cursor)
+            .context("Failed to read bundle meta data")?;
+
+        let mut blob = vec![];
+        for block in &meta_data.blocks {
+            let mut buffer = vec![0; block.compressed_size as usize];
+            cursor
+                .read_exact(&mut buffer)
+                .with_context(|| format!("Failed to read block {:?}", block))?;
+            match block.flags & 0x3F {
+                0 => blob.extend(buffer),
+                1 => {
+                    let mut reader = BufReader::new(buffer.as_slice());
+                    let mut output_buffer: Vec<u8> = vec![];
+                    let options = lzma_rs::decompress::Options {
+                        unpacked_size: UnpackedSize::UseProvided(Some(
+                            block.decompressed_size as u64,
+                        )),
+                        ..Default::default()
+                    };
+                    lzma_rs::lzma_decompress_with_options(
+                        &mut reader,
+                        &mut output_buffer,
+                        &options,
+                    )?;
+                    blob.extend(output_buffer);
+                }
+                2 | 3 => {
+                    blob.extend(lz4_flex::decompress(
+                        &buffer,
+                        block.decompressed_size as usize,
+                    )?);
+                }
+                _ => bail!("unsupported compression type '{}'", block.flags & 0x3F),
+            };
+        }
+
+        let mut files = IndexMap::new();
+        for node in meta_data.nodes {
+            let start = node.offset as usize;
+            let end = (node.offset + node.size) as usize;
+            if end > blob.len() || start >= blob.len() {
+                bail!("corrupted file offset/size for node '{}'", node.path);
+            }
+            files.insert(
+                node.path.to_string(),
+                match node.file_type {
+                    BundleFileType::Raw => BundleFile::Raw(blob[start..end].to_vec()),
+                    BundleFileType::Assets => {
+                        let mut cursor = Cursor::new(blob[start..end].to_vec());
+                        let cock = AssetFileLite::read_le(&mut cursor)?;
+                        *cock.reader.lock().unwrap() = Box::new(cursor);
+                        BundleFile::AssetsLite(cock)
+                    }
+                },
+            );
+        }
+        Ok(Self { files })
+    }
+
     fn read_header_and_meta_data<T>(reader: &mut T) -> Result<MetaData>
     where
         T: Read + Seek,
@@ -145,6 +211,9 @@ impl Bundle {
                     let mut cursor = Cursor::new(&mut uncompressed_blob);
                     cursor.set_position(base_size);
                     assets_file.write_le(&mut cursor)?
+                },
+                BundleFile::AssetsLite(asset_file) => {
+                    panic!("nope")
                 }
             }
             nodes.push(Node {
@@ -292,18 +361,19 @@ impl From<&BundleFile> for BundleFileType {
     fn from(value: &BundleFile) -> Self {
         match value {
             BundleFile::Raw(_) => BundleFileType::Raw,
-            BundleFile::Assets(_) => BundleFileType::Assets,
+            BundleFile::Assets(_) | BundleFile::AssetsLite(_) => BundleFileType::Assets,
         }
     }
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub enum BundleFile {
     Raw(Vec<u8>),
     Assets(AssetFile),
+    AssetsLite(AssetFileLite),
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct TextBundle(Bundle);
 
 impl TextBundle {
@@ -378,7 +448,7 @@ impl TextBundle {
     }
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct TerrainBundle(Bundle);
 
 impl TerrainBundle {
@@ -440,7 +510,7 @@ impl TerrainBundle {
     }
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct MessageBundle(TextBundle, MessageMap);
 
 impl MessageBundle {

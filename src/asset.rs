@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
+use std::sync::Mutex;
 
 use anyhow::{bail, Result};
 use binrw::meta::{EndianKind, ReadEndian, WriteEndian};
@@ -192,6 +193,81 @@ fn read_assets<R: Read + Seek>(
         )?);
     }
     Ok(assets)
+}
+
+pub trait SeekRead: std::io::Read + std::io::Seek {}
+impl<R: std::io::Read + std::io::Seek> SeekRead for R {}
+
+#[binread]
+#[br(little, assert(ref_type_count == 0))]
+pub struct AssetFileLite {
+    #[brw(big)]
+    header: AssetFileHeader,
+
+    #[br(temp)]
+    type_count: u32,
+    #[br(count = type_count)]
+    pub types: Vec<AssetFileType>,
+
+    #[br(align_after = 4, temp)]
+    object_count: u32,
+    #[br(count = object_count)]
+    objects: Vec<AssetFileObject>,
+    #[br(calc = objects.iter().map(|obj| obj.path_id).collect())]
+    path_ids: Vec<u64>,
+    #[br(calc = calculate_object_order(&objects))]
+    object_order: Vec<usize>,
+    #[br(temp)]
+    script_count: u32,
+    #[br(count = script_count)]
+    scripts: Vec<AssetScript>,
+
+    #[br(temp)]
+    external_count: u32,
+    #[br(count = external_count)]
+    pub externals: Vec<AssetExternal>,
+    #[br(temp)]
+    ref_type_count: u32,
+    user_info: NullString,
+
+    #[br(calc = Mutex::new(Box::new(Cursor::new([])) as _))]
+    pub reader: Mutex<Box<dyn SeekRead + Send>>,
+}
+
+use std::sync::MutexGuard;
+
+// Wrapper type for implementing Read + Seek for MutexGuard
+#[repr(transparent)]
+struct MutexReader<'a>(MutexGuard<'a, Box<dyn SeekRead + Send + 'static>>);
+
+impl<'a> std::io::Read for MutexReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<'a> std::io::Seek for MutexReader<'a> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+impl AssetFileLite {
+    pub fn get_asset(&self) -> BinResult<Asset> {
+        let mut sorted_objects = self.objects.iter().collect_vec();
+        sorted_objects.sort_by(|a, b| a.offset.cmp(&b.offset));
+        let obj = sorted_objects.iter().find(|obj| self.types[obj.type_id as usize].type_hash == ASSET_BUNDLE_HASH).unwrap();
+        let ty = &self.types[obj.type_id as usize]; // TODO: Bounds check.
+        let mut reader = Box::new(MutexReader(self.reader.lock().unwrap()));
+        
+        reader.seek(SeekFrom::Start(self.header.data_offset + obj.offset))?;
+
+        Asset::read_options(
+            &mut reader,
+            Endian::Little,
+            (ty.type_hash, obj.path_id),
+        )
+    }
 }
 
 // Object table entries appear to be ordered randomly.
