@@ -132,9 +132,9 @@ impl Bundle {
                     blob.extend(output_buffer);
                 }
                 2 | 3 => {
-                    blob.extend(lz4_flex::decompress(
+                    blob.extend(lz4::block::decompress(
                         &buffer,
-                        block.decompressed_size as usize,
+                        Some(block.decompressed_size as i32),
                     )?);
                 }
                 _ => bail!("unsupported compression type '{}'", block.flags & 0x3F),

@@ -268,6 +268,143 @@ impl AssetFileLite {
             (ty.type_hash, obj.path_id),
         )
     }
+
+    pub fn get_assets(&self) -> BinResult<Vec<Asset>> {
+        let mut assets = vec![];
+        let mut reader = Box::new(MutexReader(self.reader.lock().unwrap()));
+
+        let mut sorted_objects = self.objects.iter().collect_vec();
+        sorted_objects.sort_by(|a, b| a.offset.cmp(&b.offset));
+
+        for obj in sorted_objects {
+            let ty = &self.types[obj.type_id as usize]; // TODO: Bounds check.
+            reader.seek(SeekFrom::Start(self.header.data_offset + obj.offset))?;
+            assets.push(Asset::read_options(
+                &mut reader,
+                Endian::Little,
+                (ty.type_hash, obj.path_id),
+            )?);
+        }
+        Ok(assets)
+    }
+
+    fn read_assets<R: Read + Seek>(
+        reader: &mut R,
+        endian: Endian,
+        types: &[AssetFileType],
+        objects: &[AssetFileObject],
+        data_offset: u64,
+    ) -> BinResult<Vec<Asset>> {
+        let mut assets = vec![];
+        let mut sorted_objects = objects.iter().collect_vec();
+        sorted_objects.sort_by(|a, b| a.offset.cmp(&b.offset));
+        for obj in sorted_objects {
+            let ty = &types[obj.type_id as usize]; // TODO: Bounds check.
+            reader.seek(SeekFrom::Start(data_offset + obj.offset))?;
+            assets.push(Asset::read_options(
+                reader,
+                endian,
+                (ty.type_hash, obj.path_id),
+            )?);
+        }
+        Ok(assets)
+    }
+}
+
+impl BinWrite for AssetFileLite {
+    type Args<'a> = ();
+
+    fn write_options<W: Write + Seek>(
+        &self,
+        writer: &mut W,
+        endian: Endian,
+        _: Self::Args<'_>,
+    ) -> BinResult<()> {
+        let assets = self.get_assets()?;
+
+        // Reserve space for the header. Don't know enough to build it yet.
+        let base_position = writer.stream_position()?;
+        for _ in 0..(0x36 + self.header.unity_version.len()) {
+            writer.write_u8(0)?;
+        }
+
+        // Write the rest of the file (ignoring the header)
+        let meta_data_base = writer.stream_position()?;
+        (self.types.len() as u32).write_options(writer, endian, ())?;
+        self.types.write_options(writer, endian, ())?;
+        (assets.len() as u32).write_options(writer, endian, ())?;
+        write_padding(writer, 4)?;
+        // Objects. Don't know the object sizes yet, so come back later.
+        let objects_position = writer.stream_position()?;
+        for _ in 0..(24 * assets.len()) {
+            writer.write_u8(0)?;
+        }
+        (self.scripts.len() as u32).write_options(writer, endian, ())?;
+        self.scripts.write_options(writer, endian, ())?;
+        (self.externals.len() as u32).write_options(writer, endian, ())?;
+        self.externals.write_options(writer, endian, ())?;
+        // Ref types - not supported yet.
+        writer.write_u32::<BigEndian>(0)?;
+        self.user_info.write_options(writer, endian, ())?;
+
+        let meta_data_size = writer.stream_position()? - meta_data_base;
+        write_padding(writer, 16)?;
+        let data_offset = (writer.stream_position()? - base_position).max(0x1000);
+        while writer.stream_position()? < base_position + data_offset {
+            writer.write_u8(0)?;
+        }
+
+        // Build the assets blob + objects table.
+        let type_hash_to_id: HashMap<i128, usize> = self
+            .types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (ty.type_hash, index))
+            .collect();
+        let mut objects = vec![AssetFileObject::default(); assets.len()];
+        let start = writer.stream_position()?;
+        for (asset, object_index) in izip!(&assets, &self.object_order) {
+            write_padding(writer, 8)?;
+            let offset = writer.stream_position()? - start;
+            asset.write_options(writer, endian, ())?;
+            write_padding(writer, 4)?;
+            objects[*object_index] = AssetFileObject {
+                path_id: 0,
+                offset,
+                size: (writer.stream_position()? - start - offset) as u32,
+                type_id: type_hash_to_id
+                    .get(&asset.type_hash())
+                    .map(|id| *id as u32)
+                    .ok_or_else(|| binrw::Error::AssertFail {
+                        pos: writer.stream_position().unwrap_or_default(),
+                        message: String::from("could not map asset back to its type ID"),
+                    })?,
+            };
+        }
+        write_padding(writer, 4)?;
+        for (i, path_id) in self.path_ids.iter().enumerate() {
+            objects[i].path_id = *path_id;
+        }
+
+        // Fill in the header and object table.
+        let end_position = writer.stream_position()?;
+        writer.seek(SeekFrom::Start(base_position))?;
+        let mut header = self.header.clone();
+        header.version = 22;
+        // While the unity version, platform, etc. are part of the header conceptually,
+        // they are actually part of the meta data for size calculations.
+        // TODO: Create a meta data type that holds all of this instead.
+        header.meta_data_size = (meta_data_size + header.unity_version.len() as u64 + 6) as u32;
+        header.file_size = end_position - base_position;
+        header.data_offset = data_offset;
+        header.platform = 38;
+        header.enable_type_tree = 1;
+        header.write_be(writer)?;
+        writer.seek(SeekFrom::Start(objects_position))?;
+        objects.write_options(writer, endian, ())?;
+        writer.seek(SeekFrom::Start(end_position))?;
+        Ok(())
+    }
 }
 
 // Object table entries appear to be ordered randomly.
