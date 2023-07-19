@@ -287,28 +287,6 @@ impl AssetFileLite {
         }
         Ok(assets)
     }
-
-    fn read_assets<R: Read + Seek>(
-        reader: &mut R,
-        endian: Endian,
-        types: &[AssetFileType],
-        objects: &[AssetFileObject],
-        data_offset: u64,
-    ) -> BinResult<Vec<Asset>> {
-        let mut assets = vec![];
-        let mut sorted_objects = objects.iter().collect_vec();
-        sorted_objects.sort_by(|a, b| a.offset.cmp(&b.offset));
-        for obj in sorted_objects {
-            let ty = &types[obj.type_id as usize]; // TODO: Bounds check.
-            reader.seek(SeekFrom::Start(data_offset + obj.offset))?;
-            assets.push(Asset::read_options(
-                reader,
-                endian,
-                (ty.type_hash, obj.path_id),
-            )?);
-        }
-        Ok(assets)
-    }
 }
 
 impl BinWrite for AssetFileLite {
