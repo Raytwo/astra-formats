@@ -1,4 +1,5 @@
-use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::borrow::Cow;
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,6 +16,13 @@ use crate::{
     pack_astra_script, pack_msbt_entry, parse_astra_script_entry, parse_msbt_entry,
     parse_msbt_script,
 };
+
+#[derive(Debug, Clone, Copy)]
+pub enum CompressionType {
+    Lz4,
+    Lzma,
+    Uncompressed,
+}
 
 #[derive(Debug)]
 pub struct Bundle {
@@ -68,7 +76,7 @@ impl Bundle {
                     blob.extend(output_buffer);
                 }
                 2 | 3 => {
-                    blob.extend(lz4_flex::decompress(
+                    blob.extend(lz4_flex::block::decompress(
                         &buffer,
                         block.decompressed_size as usize,
                     )?);
@@ -81,6 +89,10 @@ impl Bundle {
         for node in meta_data.nodes {
             let start = node.offset as usize;
             let end = (node.offset + node.size) as usize;
+            // FAILSAFE: Some nodes appear to be of size 0, so we skip them (users manually toying with resS?)
+            if end - start == 0 {
+                continue;
+            }
             if end > blob.len() || start >= blob.len() {
                 bail!("corrupted file offset/size for node '{}'", node.path);
             }
@@ -104,7 +116,16 @@ impl Bundle {
     {
         let header = Header::read_be(reader)?;
         let mut buffer = vec![0; header.compressed_size as usize];
-        reader.read_exact(&mut buffer)?;
+        if header.flags & 0x80 != 0 {
+            let position = reader.stream_position()?;
+            reader.seek(SeekFrom::Start(
+                header.file_size - header.compressed_size as u64,
+            ))?;
+            reader.read_exact(&mut buffer)?;
+            reader.seek(SeekFrom::Start(position))?;
+        } else {
+            reader.read_exact(&mut buffer)?;
+        }
         let decompressed_data = match header.flags & 0x3F {
             0 => buffer,
             1 => {
@@ -118,7 +139,7 @@ impl Bundle {
                     .context("LZMA decompression failed")?;
                 output_buffer
             }
-            2 | 3 => lz4_flex::decompress(&buffer, header.decompressed_size as usize)
+            2 | 3 => lz4_flex::block::decompress(&buffer, header.decompressed_size as usize)
                 .context("LZ4 decompression failed")?,
             _ => bail!("unsupported compression type '{}'", header.flags & 0x3F),
         };
@@ -134,6 +155,16 @@ impl Bundle {
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>> {
+        self.serialize_with_block_compression(CompressionType::Uncompressed)
+    }
+
+    pub fn serialize_with_block_compression(&self, compression_type: CompressionType) -> Result<Vec<u8>> {
+        let compression_flag = match compression_type {
+            CompressionType::Lz4 => 3,
+            CompressionType::Lzma => 1,
+            CompressionType::Uncompressed => 0,
+        };
+
         // Combine files into a single buffer and build node data.
         let mut nodes = vec![];
         let mut uncompressed_blob = vec![];
@@ -160,13 +191,17 @@ impl Bundle {
         let mut blocks = vec![];
         for chunk_start in (0..uncompressed_blob.len()).step_by(0x20000) {
             let chunk_end = (chunk_start + 0x20000).min(uncompressed_blob.len());
-            let chunk_buffer = lz4_flex::compress(&uncompressed_blob[chunk_start..chunk_end]);
+            let chunk_buffer: Cow<[u8]> = match compression_type {
+                CompressionType::Lz4 => Cow::Owned(lz4_flex::block::compress(&uncompressed_blob[chunk_start..chunk_end])),
+                CompressionType::Lzma => bail!("LZMA compression is not supported yet"),
+                CompressionType::Uncompressed => Cow::Borrowed(&uncompressed_blob[chunk_start..chunk_end]),
+            };
             blocks.push(Block {
                 decompressed_size: (chunk_end - chunk_start) as u32,
                 compressed_size: chunk_buffer.len() as u32,
-                flags: 0x3,
+                flags: compression_flag,
             });
-            compressed_blob.extend(chunk_buffer);
+            compressed_blob.extend(chunk_buffer.iter());
         }
         uncompressed_blob.clear(); // Large buffer. Clear to reduce memory pressure.
 
@@ -298,6 +333,7 @@ impl From<&BundleFile> for BundleFileType {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum BundleFile {
     Raw(Vec<u8>),
     Assets(AssetFile),
@@ -342,6 +378,29 @@ impl TextBundle {
             let (text, _) = UTF_8.decode_with_bom_removal(&data);
             text.to_string()
         })
+    }
+
+    pub fn get_asset_name(&self) -> Result<String> {
+        self.0
+            .files
+            .values()
+            .find_map(|file| {
+                if let BundleFile::Assets(assets_file) = file {
+                    Some(assets_file)
+                } else {
+                    None
+                }
+            })
+            .and_then(|assets_file| {
+                assets_file.assets.iter().find_map(|asset| {
+                    if let Asset::Text(text) = asset {
+                        Some(text.name.0.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| anyhow!("bundle does not contain any text assets"))
     }
 
     pub fn replace_raw(&mut self, new_data: Vec<u8>) -> Result<()> {
@@ -474,7 +533,6 @@ impl MessageBundle {
         self.0.rename_cab(new_file_name)
     }
 
-    #[cfg(not(feature = "msbt_script"))]
     pub fn extract_data(&mut self) -> Result<IndexMap<String, Vec<u16>>> {
         Ok(std::mem::take(&mut self.1.messages))
     }
@@ -498,7 +556,6 @@ impl MessageBundle {
         Ok(out)
     }
 
-    #[cfg(not(feature = "msbt_script"))]
     pub fn replace_data(&mut self, new_data: IndexMap<String, Vec<u16>>) -> Result<()> {
         self.1.messages = new_data;
         Ok(())

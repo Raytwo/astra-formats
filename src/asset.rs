@@ -75,6 +75,37 @@ pub struct AssetFile {
     pub assets: Vec<Asset>,
 }
 
+impl AssetFile {
+    pub fn get_asset_by_path_id(&self, path_id: i64) -> Option<&Asset> {
+        let index = self
+            .path_ids
+            .iter()
+            .enumerate()
+            .find_map(|(index, elem)| (*elem as i64 == path_id).then_some(index))?;
+        self.object_order
+            .iter()
+            .enumerate()
+            .find_map(|(actual_index, elem)| {
+                (*elem == index).then(|| self.assets.get(actual_index))
+            })
+            .flatten()
+    }
+
+    pub fn get_asset_by_path_id_mut(&mut self, path_id: i64) -> Option<&mut Asset> {
+        let index = self
+            .path_ids
+            .iter()
+            .enumerate()
+            .find_map(|(index, elem)| (*elem as i64 == path_id).then_some(index))?;
+        let actual_index = self
+            .object_order
+            .iter()
+            .enumerate()
+            .find_map(|(actual_index, elem)| (*elem == index).then_some(actual_index))?;
+        self.assets.get_mut(actual_index)
+    }
+}
+
 impl BinWrite for AssetFile {
     type Args<'a> = ();
 
@@ -456,6 +487,7 @@ pub enum Asset {
     SkinnedMeshRenderer(SkinnedMeshRenderer),
     SpringJob(MonoBehavior<SpringJob>),
     SpringBone(MonoBehavior<SpringBone>),
+    Unparsed(Unparsed),
 }
 
 impl Asset {
@@ -481,6 +513,7 @@ impl Asset {
             Asset::SkinnedMeshRenderer(_) => SKINNED_MESH_RENDERER_HASH,
             Asset::SpringJob(_) => SPRING_JOB_MONO_BEHAVIOR_HASH,
             Asset::SpringBone(_) => SPRING_BONE_MONO_BEHAVIOR_HASH,
+            Asset::Unparsed(blob) => blob.type_hash,
         }
     }
 }
@@ -529,15 +562,40 @@ impl BinRead for Asset {
             SPRING_BONE_MONO_BEHAVIOR_HASH => {
                 MonoBehavior::<SpringBone>::read_options(reader, endian, ()).map(Self::SpringBone)
             }
-            _ => Err(binrw::Error::NoVariantMatch {
-                pos: reader.stream_position()?,
-            }),
+            _ => Ok(Self::Unparsed(Unparsed {
+                type_hash,
+                path_id: pptr,
+                blob: binrw::until_eof(reader, endian, ())?,
+            })),
         }
     }
 }
 
 impl ReadEndian for Asset {
     const ENDIAN: EndianKind = EndianKind::Endian(Endian::Little);
+}
+
+#[binread]
+#[derive(Debug, Clone)]
+pub struct Unparsed {
+    pub type_hash: i128,
+    pub path_id: u64,
+    #[br(ignore)]
+    pub blob: Vec<u8>,
+}
+
+impl BinWrite for Unparsed {
+    type Args<'a> = ();
+
+    fn write_options<W: Write + Seek>(
+        &self,
+        writer: &mut W,
+        endian: Endian,
+        args: Self::Args<'_>,
+    ) -> BinResult<()> {
+        self.blob.write_options(writer, endian, args)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -870,7 +928,7 @@ where
     fn clone(&self) -> Self {
         Self {
             game_object: self.game_object.clone(),
-            enabled: self.enabled.clone(),
+            enabled: self.enabled,
             script: self.script.clone(),
             name: self.name.clone(),
             data: self.data.clone(),
@@ -1281,6 +1339,7 @@ pub struct BlendShapeVertex {
 #[binrw]
 #[derive(Debug)]
 pub struct MeshBlendShape {
+    #[brw(align_before = 4)]
     pub first_vertex: u32,
     pub vertex_count: u32,
     pub has_normals: u8,

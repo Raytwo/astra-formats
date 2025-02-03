@@ -23,18 +23,7 @@ impl Book {
     }
 
     pub fn from_string(contents: &str) -> Result<Self> {
-        let mut book: Self = quick_xml::de::from_str(contents)?;
-
-        // quick-xml allows newlines in attributes and will automatically unescape
-        // a newline sequence when it encounters it.
-        // We replace this with a space since there isn't a great way to prevent quick-xml
-        // from writing a newline otherwise.
-        for sheet in &mut book.sheets {
-            for param in &mut sheet.header.params {
-                param.name = param.name.replace('\n', " ");
-            }
-        }
-
+        let book: Self = quick_xml::de::from_str(contents)?;
         Ok(book)
     }
 
@@ -230,18 +219,21 @@ where
         let mut key = None;
         let mut bucket = vec![];
         for row in sheet.params.into_iter() {
-            let item = T::from_sheet_data_param(row.values)?;
-            let item_key = item.get_key();
-            if !item_key.is_empty() {
-                if let Some(key) = key {
-                    items.insert(key, std::mem::take(&mut bucket));
-                }
-                key = Some(item_key.to_string());
-            } else {
+            let new_key = row
+                .values
+                .get(T::key_identifier())
+                .cloned()
+                .unwrap_or_default();
+            if new_key.is_empty() {
                 if key.is_none() {
                     bail!("found values before a key in public array");
                 }
-                bucket.push(item);
+                bucket.push(T::from_sheet_data_param(row.values)?);
+            } else {
+                if let Some(key) = key {
+                    items.insert(key, std::mem::take(&mut bucket));
+                }
+                key = Some(new_key.to_string());
             }
         }
         if let Some(key) = key {
@@ -348,6 +340,8 @@ where
                             (attribute_name, key.clone())
                         } else if param.type_name == "flag" {
                             (attribute_name, "0".to_owned())
+                        } else if param.type_name == "bool" {
+                            (attribute_name, "false".to_owned())
                         } else {
                             (attribute_name, String::new())
                         }
