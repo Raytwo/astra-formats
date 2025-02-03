@@ -217,7 +217,6 @@ fn read_assets<R: Read + Seek>(
     for obj in sorted_objects {
         let ty = &types[obj.type_id as usize]; // TODO: Bounds check.
         reader.seek(SeekFrom::Start(data_offset + obj.offset))?;
-        dbg!("Type hash: {}", ty.type_hash);
         assets.push(Asset::read_options(
             reader,
             endian,
@@ -561,6 +560,9 @@ impl BinRead for Asset {
             }
             SPRING_BONE_MONO_BEHAVIOR_HASH => {
                 MonoBehavior::<SpringBone>::read_options(reader, endian, ()).map(Self::SpringBone)
+            }
+            SHADER_HASH => {
+                Shader::read_options(reader, endian, ()).map(Self::Shader)
             }
             _ => Ok(Self::Unparsed(Unparsed {
                 type_hash,
